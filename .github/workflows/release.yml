@@ -1,0 +1,258 @@
+name: Release
+
+# Releases are driven by tags. The version bump lands on main through a normal
+# PR (`mise run release:prepare <version>`), then pushing the tag
+# (`mise run release:tag`) triggers this workflow. The workflow never writes to
+# git, so it works with branch protection and can be re-run for the same tag
+# if any step fails.
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.0). Re-runs the release for an existing tag."
+        required: true
+        type: string
+      dry_run:
+        description: "Dry run: build and package from the selected branch without requiring the tag or publishing anything"
+        required: false
+        default: false
+        type: boolean
+
+# Only one release at a time so concurrent runs can't clobber release assets.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+
+jobs:
+  release:
+    name: Build, Release & Update Homebrew
+    runs-on: ubuntu-latest
+    steps:
+      - name: Normalize version
+        id: version
+        env:
+          RAW_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+        run: |
+          # Strip leading 'v' if present
+          VERSION="${RAW_TAG#v}"
+
+          # Validate semver pattern (e.g. 0.1.0 or 1.0.0-rc.1)
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "::error::Invalid version format: '$RAW_TAG'. Expected semantic version like 'v0.1.0' or 'v1.0.0'."
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "TAG=v${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # A dry run builds the branch the workflow was dispatched from, so a
+          # release PR can be checked before merging. Real releases build the tag.
+          ref: ${{ env.DRY_RUN == 'true' && github.ref || format('refs/tags/v{0}', steps.version.outputs.version) }}
+
+      - name: Verify release commit
+        run: |
+          ZON_VERSION="$(sed -n 's/.*\.version = "\(.*\)".*/\1/p' build.zig.zon)"
+          if [ "$ZON_VERSION" != "$VERSION" ]; then
+            echo "::error::build.zig.zon has version '${ZON_VERSION}' but the release is '${VERSION}'. Merge the version bump PR (mise run release:prepare ${VERSION}) before tagging."
+            exit 1
+          fi
+
+          if [ "$DRY_RUN" != "true" ] && ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::${TAG} points at $(git rev-parse --short HEAD), which is not on main."
+            exit 1
+          fi
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.17.0"
+
+      - name: Setup nfpm
+        run: |
+          NFPM_VERSION="2.47.0"
+          curl -sfLo /tmp/nfpm.tar.gz "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          sudo tar -xz -C /usr/local/bin nfpm -f /tmp/nfpm.tar.gz
+          rm /tmp/nfpm.tar.gz
+          nfpm --version
+
+      - name: Cross-build targets
+        run: |
+          mkdir -p staging dist
+
+          # Map: zig target : archive platform name
+          TARGETS=(
+            "aarch64-macos:macos-aarch64"
+            "x86_64-macos:macos-x86_64"
+            "aarch64-linux:linux-aarch64"
+            "x86_64-linux:linux-x86_64"
+          )
+
+          for item in "${TARGETS[@]}"; do
+            TARGET="${item%%:*}"
+            PLATFORM="${item##*:}"
+            PREFIX="staging/${PLATFORM}"
+
+            echo "=== Building target: ${TARGET} (${PLATFORM}) ==="
+            zig build install -Dtarget="${TARGET}" -Doptimize=ReleaseSafe --prefix "${PREFIX}"
+
+            # Copy LICENSE (if present) and README into release bundle
+            if [ -f LICENSE ]; then
+              cp LICENSE "${PREFIX}/"
+            fi
+            cp README.md "${PREFIX}/"
+
+            # Copy binaries to top-level of archive for direct execution and Homebrew formula installation
+            cp "${PREFIX}"/bin/* "${PREFIX}/"
+
+            # Create archive
+            ARCHIVE_NAME="staind-${PLATFORM}.tar.gz"
+            tar -czf "dist/${ARCHIVE_NAME}" -C "${PREFIX}" .
+            echo "Successfully packaged dist/${ARCHIVE_NAME}"
+          done
+
+      - name: Build Debian and Arch packages
+        run: |
+          LINUX_ARCHS=(
+            "amd64:staging/linux-x86_64"
+            "arm64:staging/linux-aarch64"
+          )
+
+          for item in "${LINUX_ARCHS[@]}"; do
+            ARCH="${item%%:*}"
+            TARGET_DIR="${item##*:}"
+
+            echo "=== Packaging Debian and Arch for ${ARCH} (from ${TARGET_DIR}) ==="
+            ARCH="${ARCH}" VERSION="${VERSION}" TARGET_DIR="${TARGET_DIR}" nfpm package --config nfpm.yaml --packager deb --target dist/
+            ARCH="${ARCH}" VERSION="${VERSION}" TARGET_DIR="${TARGET_DIR}" nfpm package --config nfpm.yaml --packager archlinux --target dist/
+          done
+
+      - name: Generate SHA256 checksums
+        id: checksums
+        run: |
+          cd dist
+          sha256sum staind-*.tar.gz staind*.deb staind*.pkg.tar.zst > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+          echo "macos_aarch64_sha=$(sha256sum staind-macos-aarch64.tar.gz | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "macos_x86_64_sha=$(sha256sum staind-macos-x86_64.tar.gz | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "linux_aarch64_sha=$(sha256sum staind-linux-aarch64.tar.gz | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "linux_x86_64_sha=$(sha256sum staind-linux-x86_64.tar.gz | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        if: ${{ env.DRY_RUN != 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.TAG }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            dist/staind-*.tar.gz
+            dist/staind*.deb
+            dist/staind*.pkg.tar.zst
+            dist/SHA256SUMS.txt
+
+      - name: Update Homebrew formula in erietz/homebrew-tap
+        if: ${{ env.DRY_RUN != 'true' }}
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          MACOS_AARCH64_SHA: ${{ steps.checksums.outputs.macos_aarch64_sha }}
+          MACOS_X86_64_SHA: ${{ steps.checksums.outputs.macos_x86_64_sha }}
+          LINUX_AARCH64_SHA: ${{ steps.checksums.outputs.linux_aarch64_sha }}
+          LINUX_X86_64_SHA: ${{ steps.checksums.outputs.linux_x86_64_sha }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "::warning::Secret HOMEBREW_TAP_TOKEN is not configured. Skipping erietz/homebrew-tap update."
+            echo "To enable automated Homebrew updates, add a Personal Access Token with repo scope as HOMEBREW_TAP_TOKEN in repository secrets."
+            exit 0
+          fi
+
+          echo "Cloning erietz/homebrew-tap..."
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/erietz/homebrew-tap.git" tap-repo
+          mkdir -p tap-repo/Formula
+
+          python3 -c '
+          import os
+
+          version = os.environ["VERSION"]
+          macos_aarch64_sha = os.environ["MACOS_AARCH64_SHA"]
+          macos_x86_64_sha = os.environ["MACOS_X86_64_SHA"]
+          linux_aarch64_sha = os.environ["LINUX_AARCH64_SHA"]
+          linux_x86_64_sha = os.environ["LINUX_X86_64_SHA"]
+
+          formula = f"""class Staind < Formula
+            desc "Color command output written to a FIFO"
+            homepage "https://github.com/erietz/staind"
+            version "{version}"
+            license "GPL-3.0-only"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/erietz/staind/releases/download/v{version}/staind-macos-aarch64.tar.gz"
+                sha256 "{macos_aarch64_sha}"
+              elsif Hardware::CPU.intel?
+                url "https://github.com/erietz/staind/releases/download/v{version}/staind-macos-x86_64.tar.gz"
+                sha256 "{macos_x86_64_sha}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "https://github.com/erietz/staind/releases/download/v{version}/staind-linux-aarch64.tar.gz"
+                sha256 "{linux_aarch64_sha}"
+              elsif Hardware::CPU.intel?
+                url "https://github.com/erietz/staind/releases/download/v{version}/staind-linux-x86_64.tar.gz"
+                sha256 "{linux_x86_64_sha}"
+              end
+            end
+
+            def install
+              bin.install "staind"
+            end
+
+            test do
+              output = shell_output("#{{bin}}/staind -h 2>&1")
+              assert_match "usage: cmd 2>$(staind", output
+            end
+          end
+          """
+
+          # Strip indentation
+          lines = formula.strip().splitlines()
+          processed = [line[10:] if line.startswith("          ") else line for line in lines]
+          clean_formula = "\n".join(processed) + "\n"
+
+          with open("tap-repo/Formula/staind.rb", "w") as f:
+              f.write(clean_formula)
+          '
+
+          cd tap-repo
+          git add Formula/staind.rb
+          if git diff --staged --quiet; then
+            echo "Formula/staind.rb is already up to date."
+          else
+            git commit -m "Update staind to v${VERSION}"
+            git push origin main
+            echo "Successfully updated Formula/staind.rb in erietz/homebrew-tap!"
+          fi
