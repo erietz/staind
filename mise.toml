@@ -1,3 +1,8 @@
 [tools]
 zig = "0.17.0"
 zls = "0.17.0"
+vhs = "latest"
+
+[tasks."install"]
+env.PREFIX = "$HOME/.local"
+run = 'zig build install --prefix {{ env.PREFIX }}'
