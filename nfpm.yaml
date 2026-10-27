@@ -1,0 +1,29 @@
+name: "staind"
+arch: "${ARCH}"
+platform: "linux"
+version: "${VERSION}"
+section: "utils"
+priority: "optional"
+maintainer: "Ethan Rietz <ewrietz@gmail.com>"
+description: "Color command output written to a FIFO"
+homepage: "https://github.com/erietz/staind"
+license: "GPL-3.0-only"
+
+contents:
+  - src: "${TARGET_DIR}/bin/staind"
+    dst: /usr/bin/staind
+    file_info:
+      mode: 0755
+    expand: true
+  - src: LICENSE
+    dst: /usr/share/licenses/staind/LICENSE
+    file_info:
+      mode: 0644
+  - src: LICENSE
+    dst: /usr/share/doc/staind/copyright
+    file_info:
+      mode: 0644
+  - src: README.md
+    dst: /usr/share/doc/staind/README.md
+    file_info:
+      mode: 0644
