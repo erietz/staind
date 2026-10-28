@@ -7,7 +7,6 @@ const Io = std.Io;
 extern "c" fn mkfifo(path: [*:0]const u8, mode: c.mode_t) c_int;
 extern "c" fn fork() c_int;
 extern "c" fn close(fd: c.fd_t) c_int;
-extern "c" fn arc4random_buf(buf: [*]u8, len: usize) void;
 
 /// Printed instead of a FIFO path when coloring is disabled or setup fails,
 /// so the wrapped command still runs and its output still reaches the screen.
@@ -97,9 +96,17 @@ fn run(init: std.process.Init.Minimal) !void {
     }
 }
 
+fn fillRandomBytes(buf: []u8) !void {
+    const fd = c.open("/dev/urandom", .{ .ACCMODE = .RDONLY });
+    if (fd < 0) return error.EntropyUnavailable;
+    defer _ = close(fd);
+    const n = c.read(fd, buf.ptr, buf.len);
+    if (n != buf.len) return error.EntropyUnavailable;
+}
+
 fn getStaindDir(env: std.process.Environ, dir_buf: []u8) ![:0]const u8 {
     var rand: [8]u8 = undefined;
-    arc4random_buf(&rand, rand.len);
+    try fillRandomBytes(&rand);
     const tmp = std.mem.trimEnd(
         u8,
         env.getPosix("TMPDIR") orelse "/tmp",
